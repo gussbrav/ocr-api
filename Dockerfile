@@ -6,7 +6,7 @@ RUN apt-get update && apt-get install -y \
     tesseract-ocr-spa \
     tesseract-ocr-eng \
     poppler-utils \
-    libgl1-mesa-glx \
+    libgl1-mesa-dri \
     libglib2.0-0 \
     libsm6 \
     libxext6 \

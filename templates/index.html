@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PDF a Texto - API OCR</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        }
+        h1 {
+            text-align: center;
+            color: #2c3e50;
+        }
+        .api-info {
+            background-color: #e3f2fd;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            border-left: 4px solid #2196f3;
+        }
+        .endpoint {
+            background-color: #f9f9f9;
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 5px;
+            border: 1px solid #ddd;
+        }
+        .method {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-weight: bold;
+            font-size: 12px;
+            margin-right: 10px;
+        }
+        .post { background-color: #4caf50; color: white; }
+        .get { background-color: #2196f3; color: white; }
+        code {
+            background-color: #f5f5f5;
+            padding: 2px 4px;
+            border-radius: 3px;
+            font-family: monospace;
+        }
+        pre {
+            background-color: #263238;
+            color: #fff;
+            padding: 15px;
+            border-radius: 5px;
+            overflow-x: auto;
+        }
+        .test-section {
+            margin-top: 30px;
+            padding: 20px;
+            background-color: #fff3e0;
+            border-radius: 8px;
+            border-left: 4px solid #ff9800;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>API OCR - PDF a Texto</h1>
+        
+        <div class="api-info">
+            <h2>🚀 API Lista</h2>
+            <p>Esta API convierte documentos PDF a texto usando OCR inteligente. Detecta automáticamente si el PDF contiene texto extraíble o necesita procesamiento de imágenes.</p>
+        </div>
+
+        <h2>📋 Endpoints Disponibles</h2>
+        
+        <div class="endpoint">
+            <span class="method get">GET</span>
+            <strong>/health</strong>
+            <p>Verificar el estado del servicio</p>
+            <pre>curl -X GET http://localhost:5000/health</pre>
+        </div>
+        
+        <div class="endpoint">
+            <span class="method post">POST</span>
+            <strong>/ocr/process</strong>
+            <p>Procesar un archivo PDF individual</p>
+            <p><strong>Parámetros:</strong></p>
+            <ul>
+                <li><code>file</code> - Archivo PDF (required)</li>
+                <li><code>language</code> - Idioma (spa, eng, etc.) - Opcional</li>
+                <li><code>format</code> - Formato de respuesta (txt, json) - Opcional</li>
+            </ul>
+            <pre>curl -X POST http://localhost:5000/ocr/process \
+  -F "file=@documento.pdf" \
+  -F "language=spa" \
+  -F "format=json"</pre>
+        </div>
+        
+        <div class="endpoint">
+            <span class="method post">POST</span>
+            <strong>/ocr/batch</strong>
+            <p>Procesar múltiples archivos PDF (devuelve ZIP)</p>
+            <p><strong>Parámetros:</strong></p>
+            <ul>
+                <li><code>files[]</code> - Múltiples archivos PDF (required)</li>
+                <li><code>language</code> - Idioma - Opcional</li>
+            </ul>
+            <pre>curl -X POST http://localhost:5000/ocr/batch \
+  -F "files[]=@doc1.pdf" \
+  -F "files[]=@doc2.pdf" \
+  -F "language=spa" \
+  --output results.zip</pre>
+        </div>
+
+        <div class="test-section">
+            <h2>🧪 Probar API</h2>
+            <p>Usa Postman, curl, o integra directamente con n8n usando los ejemplos de arriba.</p>
+            
+            <h3>Ejemplo de respuesta JSON:</h3>
+            <pre>{
+  "success": true,
+  "filename": "documento.pdf",
+  "pages_processed": 3,
+  "processing_time": 15.7,
+  "method": "ocr",
+  "language": "spa",
+  "text": "Texto extraído del PDF...",
+  "timestamp": "2025-08-31T15:30:45"
+}</pre>
+        </div>
+        
+        <div class="api-info">
+            <h2>🔧 Para uso con n8n</h2>
+            <p>Configura un nodo HTTP Request en n8n con:</p>
+            <ul>
+                <li><strong>Method:</strong> POST</li>
+                <li><strong>URL:</strong> http://tu-dominio.com/ocr/process</li>
+                <li><strong>Body Type:</strong> Form-Data</li>
+                <li><strong>Parameters:</strong> file, language, format</li>
+            </ul>
+        </div>
+    </div>
+</body>
+</html>

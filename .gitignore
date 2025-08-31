@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Flask
+instance/
+.webassets-cache
+
+# Folders que se crean automáticamente
+input/
+output/
+temp/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

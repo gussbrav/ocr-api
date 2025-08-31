@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-# ---- Sistema y libs nativas necesarias para OCR/PDF ----
+# --- Sistema / libs nativas para OCR ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr tesseract-ocr-eng tesseract-ocr-spa \
     poppler-utils \
@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl \
   && rm -rf /var/lib/apt/lists/*
 
-# ---- Entorno robusto (logs y menos hilos para evitar saturación) ----
+# --- Entorno robusto ---
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     OMP_NUM_THREADS=1 \
@@ -19,13 +19,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     TMPDIR=/dev/shm \
     PYTHONPATH=/app
 
-# ---- App ----
+# --- App ---
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
 COPY . .
 
-# Dirs de trabajo y usuario no root
+# Dirs y usuario no root
 RUN mkdir -p /app/input /app/output /app/temp \
  && adduser --disabled-password --gecos "" appuser \
  && chown -R appuser:appuser /app
@@ -33,25 +33,10 @@ USER appuser
 
 EXPOSE 5000
 
-# Healthcheck para que el proxy no enrute si el contenedor no está sano
+# Healthcheck para el proxy
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD curl -fsS http://127.0.0.1:5000/health || exit 1
 
-# ---- Gunicorn endurecido para cargas pesadas (PDFs 30–50 MB) ----
-# - /dev/shm para temporales: IO en RAM, evita "no space on device"
-# - timeout alto + graceful-timeout
-# - max-requests + jitter: recicla workers y evita fugas de memoria
-# - logs a stdout/stderr
-CMD ["gunicorn",
-     "--bind", "0.0.0.0:5000",
-     "--workers", "2",
-     "--worker-tmp-dir", "/dev/shm",
-     "--timeout", "600",
-     "--graceful-timeout", "60",
-     "--keep-alive", "10",
-     "--max-requests", "200",
-     "--max-requests-jitter", "60",
-     "--access-logfile", "-",
-     "--error-logfile", "-",
-     "--log-level", "info",
-     "app:app"]
+# --- Gunicorn endurecido (PDFs grandes) ---
+# ¡OJO!: JSON array en UNA sola línea
+CMD ["gunicorn","--bind","0.0.0.0:5000","--workers","2","--worker-tmp-dir","/dev/shm","--timeout","600","--graceful-timeout","60","--keep-alive","10","--max-requests","200","--max-requests-jitter","60","--access-logfile","-","--error-logfile","-","--log-level","info","app:app"]

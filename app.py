@@ -336,5 +336,10 @@ def get_file(filename):
     """Descargar archivo de salida"""
     return send_from_directory(app.config['OUTPUT_FOLDER'], filename)
 
+@app.route('/', methods=['GET'])
+def home():
+    # Sirve el index.html que está en /app (raíz del contenedor)
+    return send_from_directory(app.root_path, 'index.html')
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=False)

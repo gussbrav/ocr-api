@@ -1,54 +1,128 @@
-import io
 import os
-import re
-import gc
+import io
 import cv2
-import time
-import math
-import json
-import uuid
-import base64
+import gc
+import re
+import zipfile
 import logging
 import tempfile
 import numpy as np
-from typing import List, Tuple
+from datetime import datetime
+from typing import Tuple, List
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
+from werkzeug.utils import secure_filename
 
-from PIL import Image
 import pytesseract
-from pdf2image import convert_from_path, pdfinfo_from_path
 from PyPDF2 import PdfReader
-
+from pdf2image import convert_from_path, pdfinfo_from_path
+from PIL import Image, ImageEnhance
 
 # ----------------------------
-# Configuración básica
+# Logging
+# ----------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ----------------------------
+# App & CORS
 # ----------------------------
 app = Flask(__name__)
 CORS(app)
 
-logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO"),
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-logger = logging.getLogger("ocr-api")
+# ----------------------------
+# Config
+# ----------------------------
+app.config['UPLOAD_FOLDER']   = '/app/input'
+app.config['OUTPUT_FOLDER']   = '/app/output'
+app.config['TEMP_FOLDER']     = '/app/temp'
+app.config['TRAINING_FOLDER'] = '/app/training'
+app.config['ALLOWED_EXTENSIONS'] = {'pdf'}
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB
 
-# DPI alto para texto pequeño. Puedes subir a 600 si lo ves necesario.
-PDF_DPI = int(os.environ.get("PDF_DPI", "500"))
+for p in [app.config['UPLOAD_FOLDER'], app.config['OUTPUT_FOLDER'],
+          app.config['TEMP_FOLDER'], app.config['TRAINING_FOLDER']]:
+    os.makedirs(p, exist_ok=True)
 
-# Idiomas por defecto: español + inglés
-DEFAULT_LANG = os.environ.get("OCR_LANG", "spa+eng")
+# Tesseract (en Debian/Ubuntu dentro de Docker suele estar ahí)
+pytesseract.pytesseract.tesseract_cmd = os.environ.get('TESSERACT_CMD', '/usr/bin/tesseract')
 
+# OCR knobs via env
+OCR_LANG_DEFAULT = os.getenv('OCR_LANG', 'spa+eng')
+OCR_DPI = int(os.getenv('OCR_DPI', '450'))                  # DPI para rasterizar PDFs
+OCR_SCALE = float(os.getenv('OCR_SCALE', '3.0'))            # Upscale de imagen antes del OCR (3.0 ~ 300%)
+OSD_ENABLED = os.getenv('OSD_ENABLED', '1') == '1'          # Corrección de orientación con OSD
 
 # ----------------------------
-# Utilidades de imagen
+# Correcciones y patrones
+# ----------------------------
+CHAR_CORRECTIONS = {
+    'N0': 'N°', 'NO': 'N°', 'Np': 'N°', 'N8': 'N°', 'N6': 'N°',
+    'Nro': 'Nro', 'NRO': 'Nro', 'nro': 'Nro', 'Nr0': 'Nro', 'Nrp': 'Nro',
+    'Num': 'Núm', 'NUM': 'Núm', 'núm': 'Núm', 'numero': 'número',
+    'NUMERO': 'NÚMERO', 'JUZGADO': 'JUZGADO', 'CIVIL': 'CIVIL', 'PENAL': 'PENAL',
+    'EXPEDIENTE': 'EXPEDIENTE', 'EXP': 'EXP', 'RESOLUCION': 'RESOLUCIÓN',
+    'RESOLUCIÖN': 'RESOLUCIÓN', 'DIGITALIZACION': 'DIGITALIZACIÓN',
+    'DIGITALIZACIÖN': 'DIGITALIZACIÓN'
+}
+
+LEGAL_PATTERNS = [
+    (r'N[0O8p6]\s*(\d+)', r'N° \1'),
+    (r'Nr[0o]\s*(\d+)', r'Nro \1'),
+    (r'[Nn][úu]m\s*(\d+)', r'Núm \1'),
+    (r'EXP\s*[\.:]?\s*N[0O8p6]\s*(\d+)', r'EXP N° \1'),
+    (r'EXPEDIENTE\s*N[0O8p6]\s*(\d+)', r'EXPEDIENTE N° \1'),
+    (r'RESOLUCI[ÖO]N\s*N[0O8p6]\s*(\d+)', r'RESOLUCIÓN N° \1'),
+    # formato de expediente habitual ya está OK, lo mantenemos como recordatorio:
+    (r'(\d{4})-(\d{4})-(\w{3})-(\w{2})-(\w{2})', r'\1-\2-\3-\4-\5'),
+]
+
+# ----------------------------
+# Helpers básicos
+# ----------------------------
+def allowed_file(filename: str) -> bool:
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
+
+def contains_bitmap(pdf_path: str) -> bool:
+    """
+    Heurística: si el texto embebido es muy poco o hay XObjects /Image,
+    tratamos como bitmap para hacer OCR.
+    """
+    try:
+        with open(pdf_path, 'rb') as f:
+            reader = PdfReader(f)
+            text_len = 0
+            has_images = False
+
+            for page in reader.pages:
+                txt = page.extract_text() or ""
+                text_len += len(re.sub(r"\s+", "", txt))
+
+                # detección simple de imágenes
+                try:
+                    s = str(page.get_object())
+                    if re.search(r'/Subtype\s*/Image', s, re.IGNORECASE):
+                        has_images = True
+                except Exception:
+                    pass
+
+            # si casi no hay texto o hay imágenes por todos lados -> bitmap
+            return text_len < 100 or has_images
+    except Exception as e:
+        logger.warning(f"Error checking PDF content: {e}")
+        # En duda, tratamos como bitmap
+        return True
+
+def get_page_separator(page_num: int, total_pages: int) -> str:
+    return f"\n\n--- PÁGINA {page_num} DE {total_pages}\n\n"
+
+# ----------------------------
+# Imagen: orientación, deskew, limpieza de líneas
 # ----------------------------
 def _fix_orientation_inplace(png_path: str):
-    """
-    Usa OSD de Tesseract para detectar rotación y corrige si es necesario.
-    Modifica el archivo en disco.
-    """
+    if not OSD_ENABLED:
+        return
     try:
         osd = pytesseract.image_to_osd(png_path)
         m = re.search(r"Rotate:\s+(\d+)", osd)
@@ -57,13 +131,10 @@ def _fix_orientation_inplace(png_path: str):
             img = Image.open(png_path).convert("RGB")
             img = img.rotate(360 - rot, expand=True, fillcolor="white")
             img.save(png_path)
-            logger.debug(f"Orientation fixed by {rot} degrees for {png_path}")
-    except Exception as e:
-        logger.debug(f"OSD orientation check failed: {e}")
-
+    except Exception:
+        pass
 
 def _deskew(binary_img: np.ndarray) -> np.ndarray:
-    """Endereza la imagen binaria estimando el ángulo por el rectángulo mínimo."""
     try:
         coords = np.column_stack(np.where(binary_img == 0))
         if coords.size == 0:
@@ -72,15 +143,11 @@ def _deskew(binary_img: np.ndarray) -> np.ndarray:
         angle = -(90 + angle) if angle < -45 else -angle
         (h, w) = binary_img.shape[:2]
         M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
-        return cv2.warpAffine(
-            binary_img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE
-        )
+        return cv2.warpAffine(binary_img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
     except Exception:
         return binary_img
 
-
 def _remove_horizontal_lines(bin_img: np.ndarray) -> np.ndarray:
-    """Elimina renglones/guías horizontales que rompen palabras."""
     try:
         inv = 255 - bin_img
         k = max(30, bin_img.shape[1] // 30)
@@ -91,37 +158,41 @@ def _remove_horizontal_lines(bin_img: np.ndarray) -> np.ndarray:
     except Exception:
         return bin_img
 
-
 def enhance_image_for_ocr(image_path: str) -> np.ndarray:
     """
-    Mejora agresiva pensada para PDFs legales con texto pequeño y líneas.
-    Devuelve imagen binaria (np.ndarray) lista para OCR.
+    Pipeline robusto para documentos legales escaneados:
+    upscale -> CLAHE -> des-ruido -> Otsu -> limpiar líneas -> deskew.
+    Devuelve imagen binaria (np.uint8).
     """
     try:
         img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+        if img is None:
+            return None
 
-        # 1) Escalado para rescatar detalle
-        scale = 3.0
-        img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        # Escalado
+        if OCR_SCALE and OCR_SCALE != 1.0:
+            img = cv2.resize(img, None, fx=OCR_SCALE, fy=OCR_SCALE, interpolation=cv2.INTER_CUBIC)
 
-        # 2) Gris + CLAHE
+        # PIL para mejorar contraste un poco
+        pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        pil = ImageEnhance.Contrast(pil).enhance(1.4)
+        img = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         gray = clahe.apply(gray)
 
-        # 3) Des-ruido
-        gray = cv2.fastNlMeansDenoising(gray, h=15)
+        # Des-ruido ligero
+        gray = cv2.fastNlMeansDenoising(gray, h=14)
 
-        # 4) Umbralización Otsu
+        # Umbral Otsu
         _, thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-        # 5) Quitar líneas horizontales
+        # Quitar líneas horizontales y deskew
         thr = _remove_horizontal_lines(thr)
-
-        # 6) Deskew
         thr = _deskew(thr)
 
-        # 7) Cierre morfológico fino
+        # Cierre leve
         thr = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, np.ones((1, 1), np.uint8))
 
         return thr
@@ -129,267 +200,405 @@ def enhance_image_for_ocr(image_path: str) -> np.ndarray:
         logger.error(f"Error enhancing image: {e}")
         return None
 
-
 # ----------------------------
 # Post-procesado de texto
 # ----------------------------
-COMMON_FIXES = [
-    (r"\s+\n", "\n"),
-    (r"\n{3,}", "\n\n"),
-    (r"[ \t]{2,}", " "),
-    (r"([.,;:])\1{1,}", r"\1"),
-    (r"—\s*—", "—"),
-    (r"’", "'"),
-]
-
-
 def correct_ocr_text(text: str) -> str:
-    """Arreglos ligeros y seguros sobre la salida de OCR."""
     t = text
-    for pat, repl in COMMON_FIXES:
-        t = re.sub(pat, repl, t)
-    # Unir palabras cortadas con guion al salto de línea
-    t = re.sub(r"(\w)-\n(\w)", r"\1\2\n", t)
+
+    # Diccionario
+    for wrong, correct in CHAR_CORRECTIONS.items():
+        t = re.sub(r'\b' + re.escape(wrong) + r'\b', correct, t, flags=re.IGNORECASE)
+
+    # Patrones
+    for pattern, replacement in LEGAL_PATTERNS:
+        t = re.sub(pattern, replacement, t, flags=re.IGNORECASE)
+
+    # Limpiezas suaves
+    t = re.sub(r'[ \t]{2,}', ' ', t)
+    t = re.sub(r'\s+\n', '\n', t)
+    t = re.sub(r'\n{3,}', '\n\n', t)
+    # Unir palabras cortadas por guion al final de línea
+    t = re.sub(r'(\w)-\n(\w)', r'\1\2\n', t)
+
     return t.strip()
 
-
 # ----------------------------
-# OCR
+# OCR multipase con selección por confianza
 # ----------------------------
-def perform_advanced_ocr(image_path: str, language: str) -> str:
-    """
-    Ejecuta varios pases de OCR y elige el mejor por confianza media.
-    """
-    try:
-        base_cfg = "-c preserve_interword_spaces=1 -c user_defined_dpi=500"
-        lang = language
+def _avg_conf_from_data(data_dict) -> float:
+    vals = []
+    for c in data_dict.get('conf', []):
+        try:
+            v = int(float(c))
+            if v > 0:
+                vals.append(v)
+        except Exception:
+            continue
+    return float(np.mean(vals)) if vals else 0.0
 
-        configs = [
-            f"--psm 6 --oem 1 {base_cfg}",  # bloque de texto
-            f"--psm 4 --oem 1 {base_cfg}",  # una columna
-            f"--psm 11 --oem 1 {base_cfg}",  # líneas sueltas
-            f"--psm 6 --oem 1 {base_cfg} "
-            "-c tessedit_char_whitelist="
-            "0123456789ABCDEFGHIJKLMNÑOPQRSTUVWXYZabcdefghijklmnñopqrstuvwxyzÁÉÍÓÚáéíóú°:-./,()",
-        ]
+def perform_advanced_ocr(image_path: str, language: str = 'spa') -> str:
+    base_cfg = f"-c preserve_interword_spaces=1 -c user_defined_dpi={max(300, OCR_DPI)}"
+    configs = [
+        f"--psm 6  --oem 1 {base_cfg}",
+        f"--psm 4  --oem 1 {base_cfg}",
+        f"--psm 11 --oem 1 {base_cfg}",
+        f"--psm 6  --oem 1 {base_cfg} -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNÑOPQRSTUVWXYZabcdefghijklmnñopqrstuvwxyzÁÉÍÓÚáéíóú°:-./,()",
+    ]
 
-        best_text, max_conf = "", -1.0
-        for cfg in configs:
-            try:
-                data = pytesseract.image_to_data(
-                    image_path, lang=lang, config=cfg, output_type=pytesseract.Output.DICT
-                )
-                confs = [int(c) for c in data["conf"] if str(c).isdigit() and int(c) > 0]
-                avg = float(np.mean(confs)) if confs else 0.0
+    best_text, max_conf = "", -1.0
+    for cfg in configs:
+        try:
+            data = pytesseract.image_to_data(image_path, lang=language, config=cfg, output_type=pytesseract.Output.DICT)
+            avg = _avg_conf_from_data(data)
+            text = pytesseract.image_to_string(image_path, lang=language, config=cfg)
+            text = correct_ocr_text(text)
+            if avg >= max_conf and text.strip():
+                best_text, max_conf = text, avg
+        except Exception as e:
+            logger.debug(f"OCR pass failed: {e}")
 
-                text = pytesseract.image_to_string(image_path, lang=lang, config=cfg)
-                text = correct_ocr_text(text)
-
-                if avg >= max_conf and text.strip():
-                    best_text, max_conf = text, avg
-            except Exception as e:
-                logger.debug(f"OCR pass failed: {e}")
-
+    if not best_text.strip():
         # Fallback
-        if not best_text.strip():
-            text = pytesseract.image_to_string(image_path, lang=lang)
-            best_text = correct_ocr_text(text)
+        text = pytesseract.image_to_string(image_path, lang=language)
+        best_text = correct_ocr_text(text)
 
-        return best_text
-    except Exception as e:
-        logger.error(f"Advanced OCR failed: {e}")
-        return ""
-
+    return best_text
 
 # ----------------------------
-# PDF helpers
+# Procesamiento de PDFs
 # ----------------------------
-def _page_has_text(reader: PdfReader, page_index: int) -> Tuple[bool, str]:
-    """
-    Intenta extraer texto con PyPDF2. Si obtiene cantidad razonable, evitamos OCR.
-    """
+def process_text_pdf(pdf_path: str, output_path: str) -> Tuple[bool, int, str]:
     try:
-        page = reader.pages[page_index]
-        raw = page.extract_text() or ""
-        # Heurística: si hay suficiente texto "usable", considerar válido.
-        useful = len(re.sub(r"\s+", "", raw))
-        return (useful >= 40), correct_ocr_text(raw)
-    except Exception:
-        return (False, "")
+        with open(pdf_path, 'rb') as f:
+            reader = PdfReader(f)
+            total = len(reader.pages)
+            all_text = ""
 
+            for i, page in enumerate(reader.pages, 1):
+                page_text = page.extract_text() or ""
+                if page_text.strip():
+                    all_text += get_page_separator(i, total)
+                    all_text += correct_ocr_text(page_text)
+
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(all_text)
+
+        return True, total, all_text
+    except Exception as e:
+        logger.error(f"Error processing text PDF: {e}")
+        return False, 0, str(e)
 
 def _save_ndarray_as_png(arr: np.ndarray, path: str):
     try:
         cv2.imwrite(path, arr)
-    except Exception as e:
-        # Fallback PIL si OpenCV fallara en esta plataforma
+    except Exception:
         Image.fromarray(arr).save(path)
 
-
-def ocr_pdf_by_pages(pdf_path: str, language: str) -> Tuple[List[str], int]:
+def process_bitmap_pdf(pdf_path: str, output_path: str, language: str = 'spa') -> Tuple[bool, int, str]:
     """
-    Recorre el PDF página por página, usando texto embebido cuando existe y,
-    si no, conviertiendo esa página a PNG -> mejora -> OCR.
+    Procesa **página por página** para ser amigable con memoria en PDFs grandes.
+    No carga todas las páginas a la vez.
     """
-    pages_text: List[str] = []
-    pages_processed = 0
-
-    with tempfile.TemporaryDirectory() as tmp:
-        try:
-            info = pdfinfo_from_path(pdf_path)
-            total = int(info.get("Pages", 0))
-        except Exception:
-            # Fallback a PyPDF2 si pdfinfo falla
-            reader = PdfReader(pdf_path)
-            total = len(reader.pages)
-
-        reader = None
-        try:
-            reader = PdfReader(pdf_path)
-        except Exception:
-            pass
-
-        for p in range(total):
-            # 1) Intentar texto embebido
-            if reader is not None:
-                ok, txt = _page_has_text(reader, p)
-                if ok:
-                    pages_text.append(txt)
-                    pages_processed += 1
-                    continue
-
-            # 2) Convertir SOLO la página p a imagen (memoria-amigable)
-            png_paths = convert_from_path(
-                pdf_path,
-                dpi=PDF_DPI,
-                first_page=p + 1,
-                last_page=p + 1,
-                fmt="png",
-                output_folder=tmp,
-                paths_only=True,
-                thread_count=1,
-            )
-            if not png_paths:
-                pages_text.append("")
-                pages_processed += 1
-                continue
-
-            png_path = png_paths[0]
-
-            # 3) Corregir orientación por OSD
-            _fix_orientation_inplace(png_path)
-
-            # 4) Mejora agresiva
-            enh = enhance_image_for_ocr(png_path)
-            if enh is None:
-                # Si algo falla, usar la imagen original
-                img_for_ocr = png_path
-            else:
-                proc_path = os.path.join(tmp, f"proc_{uuid.uuid4().hex}.png")
-                _save_ndarray_as_png(enh, proc_path)
-                img_for_ocr = proc_path
-
-            # 5) OCR
-            text = perform_advanced_ocr(img_for_ocr, language=language)
-            pages_text.append(text)
-            pages_processed += 1
-
-            # Limpieza por página
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
             try:
-                for f in (png_path, img_for_ocr):
-                    if f and os.path.exists(f):
-                        os.remove(f)
+                info = pdfinfo_from_path(pdf_path)
+                total_pages = int(info.get("Pages", 0))
+            except Exception:
+                reader = PdfReader(pdf_path)
+                total_pages = len(reader.pages)
+
+            all_text = ""
+
+            for i in range(1, total_pages + 1):
+                try:
+                    # Convertir solo esta página a PNG en disco (no PIL en memoria)
+                    png_paths = convert_from_path(
+                        pdf_path,
+                        dpi=OCR_DPI,
+                        first_page=i,
+                        last_page=i,
+                        fmt="png",
+                        output_folder=temp_dir,
+                        paths_only=True,
+                        thread_count=1,
+                    )
+                    if not png_paths:
+                        all_text += get_page_separator(i, total_pages)
+                        all_text += "(Página vacía o no legible)"
+                        continue
+
+                    png_path = png_paths[0]
+
+                    # Orientación
+                    _fix_orientation_inplace(png_path)
+
+                    # Mejora agresiva
+                    enhanced = enhance_image_for_ocr(png_path)
+                    if enhanced is not None:
+                        proc_path = os.path.join(temp_dir, f"proc_{i}.png")
+                        _save_ndarray_as_png(enhanced, proc_path)
+                        img_for_ocr = proc_path
+                    else:
+                        img_for_ocr = png_path
+
+                    # OCR
+                    page_text = perform_advanced_ocr(img_for_ocr, language=language)
+
+                    all_text += get_page_separator(i, total_pages)
+                    all_text += page_text
+
+                    # Limpieza por página
+                    try:
+                        for fdel in [png_path] + ([img_for_ocr] if img_for_ocr != png_path else []):
+                            if os.path.exists(fdel):
+                                os.remove(fdel)
+                    except Exception:
+                        pass
+
+                    gc.collect()
+
+                except Exception as e:
+                    logger.error(f"Error processing page {i}: {e}")
+                    all_text += get_page_separator(i, total_pages)
+                    all_text += f"Error procesando página: {str(e)}"
+
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(all_text)
+
+            return True, total_pages, all_text
+
+    except Exception as e:
+        logger.error(f"Error processing bitmap PDF: {e}")
+        return False, 0, str(e)
+
+# ----------------------------
+# Entrypoints
+# ----------------------------
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat(),
+        'version': '2.1.0',
+        'dpi': OCR_DPI,
+        'lang_default': OCR_LANG_DEFAULT
+    })
+
+@app.route('/ocr/train', methods=['POST'])
+def train_corrections():
+    try:
+        data = request.get_json()
+        if not data or 'corrections' not in data:
+            return jsonify({'error': 'No corrections data provided'}), 400
+
+        corrections_file = os.path.join(app.config['TRAINING_FOLDER'], 'custom_corrections.txt')
+
+        with open(corrections_file, 'a', encoding='utf-8') as f:
+            for wrong, correct in data['corrections'].items():
+                f.write(f"{wrong}|{correct}\n")
+
+        load_custom_corrections()
+
+        return jsonify({
+            'success': True,
+            'message': f'Added {len(data["corrections"])} new corrections',
+            'total_corrections': len(CHAR_CORRECTIONS)
+        })
+    except Exception as e:
+        logger.error(f"Training error: {str(e)}")
+        return jsonify({'error': f'Training failed: {str(e)}'}), 500
+
+def load_custom_corrections():
+    corrections_file = os.path.join(app.config['TRAINING_FOLDER'], 'custom_corrections.txt')
+    if os.path.exists(corrections_file):
+        try:
+            with open(corrections_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    if '|' in line:
+                        wrong, correct = line.strip().split('|', 1)
+                        CHAR_CORRECTIONS[wrong] = correct
+        except Exception as e:
+            logger.warning(f"Error loading custom corrections: {e}")
+
+@app.route('/ocr/process', methods=['POST'])
+def process_pdf():
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file provided'}), 400
+
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
+
+        if not allowed_file(file.filename):
+            return jsonify({'error': 'Only PDF files are allowed'}), 400
+
+        # Parámetros
+        language = request.form.get('language', OCR_LANG_DEFAULT)
+        output_format = request.form.get('format', 'txt')  # txt | json
+
+        # Guardar archivo
+        filename = secure_filename(file.filename)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        temp_filename = f"{timestamp}_{filename}"
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], temp_filename)
+        file.save(file_path)
+
+        # Salida
+        output_filename = f"{timestamp}_{os.path.splitext(filename)[0]}.txt"
+        output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
+
+        logger.info(f"Processing file: {temp_filename} | lang={language} | dpi={OCR_DPI}")
+
+        load_custom_corrections()
+        start_time = datetime.now()
+
+        # Elección de estrategia
+        if contains_bitmap(file_path):
+            logger.info("Mode: enhanced OCR (bitmap/scan)")
+            success, pages_processed, text = process_bitmap_pdf(file_path, output_path, language)
+            method = 'enhanced_ocr'
+        else:
+            logger.info("Mode: text extraction with corrections")
+            success, pages_processed, text = process_text_pdf(file_path, output_path)
+            method = 'text_extraction_corrected'
+
+        processing_time = (datetime.now() - start_time).total_seconds()
+
+        if success:
+            if output_format == 'json':
+                return jsonify({
+                    'success': True,
+                    'filename': filename,
+                    'pages_processed': pages_processed,
+                    'processing_time': round(processing_time, 2),
+                    'method': method,
+                    'language': language,
+                    'corrections_applied': len(CHAR_CORRECTIONS),
+                    'text': text,
+                    'timestamp': datetime.now().isoformat()
+                })
+            else:
+                return send_file(output_path, as_attachment=True,
+                                 download_name=f"{os.path.splitext(filename)[0]}.txt")
+        else:
+            return jsonify({
+                'success': False,
+                'error': text,
+                'processing_time': round(processing_time, 2)
+            }), 500
+
+    except Exception as e:
+        logger.error(f"Error processing PDF: {str(e)}")
+        return jsonify({'error': f'Processing failed: {str(e)}'}), 500
+    finally:
+        try:
+            if 'file_path' in locals() and os.path.exists(file_path):
+                os.remove(file_path)
+        except Exception as e:
+            logger.warning(f"Could not remove temp file: {e}")
+
+@app.route('/ocr/batch', methods=['POST'])
+def process_batch():
+    try:
+        files = request.files.getlist('files')
+        if not files or all(f.filename == '' for f in files):
+            return jsonify({'error': 'No files provided'}), 400
+
+        language = request.form.get('language', OCR_LANG_DEFAULT)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        batch_folder = os.path.join(app.config['OUTPUT_FOLDER'], f'batch_{timestamp}')
+        os.makedirs(batch_folder, exist_ok=True)
+
+        load_custom_corrections()
+        results, temp_files = [], []
+
+        for file in files:
+            if file.filename and allowed_file(file.filename):
+                try:
+                    filename = secure_filename(file.filename)
+                    file_path = os.path.join(app.config['TEMP_FOLDER'], f"{timestamp}_{filename}")
+                    file.save(file_path)
+                    temp_files.append(file_path)
+
+                    output_filename = f"{os.path.splitext(filename)[0]}.txt"
+                    output_path = os.path.join(batch_folder, output_filename)
+
+                    if contains_bitmap(file_path):
+                        success, pages, text = process_bitmap_pdf(file_path, output_path, language)
+                        method = 'enhanced_ocr'
+                    else:
+                        success, pages, text = process_text_pdf(file_path, output_path)
+                        method = 'text_extraction_corrected'
+
+                    results.append({
+                        'filename': filename,
+                        'success': success,
+                        'pages': pages,
+                        'method': method,
+                        'corrections_applied': len(CHAR_CORRECTIONS),
+                        'error': None if success else text
+                    })
+                except Exception as e:
+                    results.append({
+                        'filename': file.filename,
+                        'success': False,
+                        'error': str(e)
+                    })
+
+        # Limpieza temp
+        for tmp in temp_files:
+            try:
+                os.remove(tmp)
             except Exception:
                 pass
 
-            gc.collect()
+        # Crear ZIP con resultados + resumen
+        zip_filename = f'ocr_batch_enhanced_{timestamp}.zip'
+        zip_path = os.path.join(app.config['OUTPUT_FOLDER'], zip_filename)
 
-    return pages_text, pages_processed
+        with zipfile.ZipFile(zip_path, 'w') as zipf:
+            for root, _, fs in os.walk(batch_folder):
+                for f in fs:
+                    zipf.write(os.path.join(root, f), f)
+            summary = {
+                'batch_id': timestamp,
+                'processed_files': len(results),
+                'successful': len([r for r in results if r['success']]),
+                'failed': len([r for r in results if not r['success']]),
+                'total_corrections_available': len(CHAR_CORRECTIONS),
+                'results': results,
+                'timestamp': datetime.now().isoformat()
+            }
+            import json as _json
+            zipf.writestr('batch_summary.json', _json.dumps(summary, indent=2, ensure_ascii=False))
 
+        return send_file(zip_path, as_attachment=True, download_name=zip_filename)
 
-# ----------------------------
-# Rutas
-# ----------------------------
-@app.get("/health")
-def health():
-    return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        logger.error(f"Batch processing error: {str(e)}")
+        return jsonify({'error': f'Batch processing failed: {str(e)}'}), 500
 
+@app.route('/output/<filename>')
+def get_file(filename):
+    return send_from_directory(app.config['OUTPUT_FOLDER'], filename)
 
-@app.post("/ocr")
-def ocr_endpoint():
-    """
-    multipart/form-data:
-      - file: PDF/JPG/PNG
-      - language (opcional): por defecto "spa+eng"
-    """
-    t0 = time.time()
+@app.route('/', methods=['GET'])
+def home():
+    return send_from_directory(app.root_path, 'index.html')
 
-    if "file" not in request.files:
-        return jsonify({"error": "file is required (multipart/form-data)"}), 400
+# Cargar correcciones personalizadas al iniciar
+def _bootstrap():
+    try:
+        load_custom_corrections()
+    except Exception:
+        pass
 
-    lang = request.form.get("language", DEFAULT_LANG).strip() or DEFAULT_LANG
+_bootstrap()
 
-    f = request.files["file"]
-    filename = f.filename or f"upload-{uuid.uuid4().hex}"
-    ext = (os.path.splitext(filename)[1] or "").lower()
-
-    with tempfile.TemporaryDirectory() as tmp:
-        upload_path = os.path.join(tmp, f"upload{ext if ext else ''}")
-        f.save(upload_path)
-
-        pages_text: List[str] = []
-        pages_processed = 0
-
-        try:
-            if ext == ".pdf" or open(upload_path, "rb").read(4) == b"%PDF":
-                pages_text, pages_processed = ocr_pdf_by_pages(upload_path, language=lang)
-            else:
-                # Imagen suelta
-                # Guardar una copia PNG si hace falta
-                img_in = upload_path
-                if ext not in (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"):
-                    # Convertir a png con PIL
-                    im = Image.open(upload_path).convert("RGB")
-                    img_in = os.path.join(tmp, "input.png")
-                    im.save(img_in)
-
-                _fix_orientation_inplace(img_in)
-                enh = enhance_image_for_ocr(img_in)
-                if enh is None:
-                    img_for_ocr = img_in
-                else:
-                    proc_path = os.path.join(tmp, f"proc_{uuid.uuid4().hex}.png")
-                    _save_ndarray_as_png(enh, proc_path)
-                    img_for_ocr = proc_path
-
-                text = perform_advanced_ocr(img_for_ocr, language=lang)
-                pages_text = [text]
-                pages_processed = 1
-
-        except Exception as e:
-            logger.exception("OCR failed")
-            return jsonify({"error": str(e)}), 500
-
-    elapsed = time.time() - t0
-    full_text = "\n\n".join(pages_text).strip()
-
-    return jsonify(
-        {
-            "success": True,
-            "language": lang,
-            "pages_processed": pages_processed,
-            "processing_time": round(elapsed, 2),
-            "pages_text": pages_text,
-            "text": full_text,
-        }
-    )
-
-
-# ----------------------------
-# Main (para desarrollo local)
-# En producción usar Gunicorn:
-#   gunicorn --bind 0.0.0.0:5000 --workers 2 --timeout 300 app:app
-# ----------------------------
-if __name__ == "__main__":
-    # Útil para pruebas locales (no usar en producción)
-    app.run(host="0.0.0.0", port=5000, debug=False)
+if __name__ == '__main__':
+    # En producción usa Gunicorn:
+    # gunicorn --bind 0.0.0.0:5000 --workers 2 --timeout 600 app:app
+    app.run(host='0.0.0.0', port=5000, debug=False)

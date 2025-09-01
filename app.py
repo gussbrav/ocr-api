@@ -8,7 +8,7 @@ import logging
 import tempfile
 import numpy as np
 from datetime import datetime
-from typing import Tuple, List
+from typing import Tuple, List, Dict, Any
 
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
@@ -18,6 +18,16 @@ import pytesseract
 from PyPDF2 import PdfReader
 from pdf2image import convert_from_path, pdfinfo_from_path
 from PIL import Image, ImageEnhance
+
+# Opcionales (para extracción de tablas nativas y CSVs)
+try:
+    import pdfplumber  # type: ignore
+except Exception:
+    pdfplumber = None
+try:
+    import pandas as pd  # type: ignore
+except Exception:
+    pd = None
 
 # ----------------------------
 # Logging
@@ -74,9 +84,72 @@ LEGAL_PATTERNS = [
     (r'EXP\s*[\.:]?\s*N[0O8p6]\s*(\d+)', r'EXP N° \1'),
     (r'EXPEDIENTE\s*N[0O8p6]\s*(\d+)', r'EXPEDIENTE N° \1'),
     (r'RESOLUCI[ÖO]N\s*N[0O8p6]\s*(\d+)', r'RESOLUCIÓN N° \1'),
-    # formato de expediente habitual ya está OK, lo mantenemos como recordatorio:
     (r'(\d{4})-(\d{4})-(\w{3})-(\w{2})-(\w{2})', r'\1-\2-\3-\4-\5'),
 ]
+
+# Patrones de dominio (Poder Judicial, PNP, SUNARP, etc.)
+FIELD_PATTERNS: Dict[str, List[re.Pattern]] = {
+    'expediente': [
+        re.compile(r'EXPEDIENTE\s*[:\-]?\s*([A-Z0-9\-\./]+)', re.I),
+    ],
+    'juzgado': [
+        re.compile(r'JUZGADO\s*[:\-]?\s*(.+)', re.I),
+        re.compile(r'JUZ\.\s*INVESTIGACI[ÓO]N\s*PREP\.\s*DE\s*(.+)', re.I),
+    ],
+    'juez': [
+        re.compile(r'JUEZ(?:A)?\s*[:\-]?\s*([A-ZÁÉÍÓÚÑ\s\.]+)', re.I),
+    ],
+    'especialista': [
+        re.compile(r'ESPECIALISTA(?:\s+LEGAL)?\s*[:\-]?\s*([A-ZÁÉÍÓÚÑ\s\.]+)', re.I),
+    ],
+    'imputado': [
+        re.compile(r'IMPUTADO\s*[:\-]?\s*(.+)', re.I),
+    ],
+    'agraviado': [
+        re.compile(r'AGRAVIADO\s*[:\-]?\s*(.+)', re.I),
+    ],
+    'delito': [
+        re.compile(r'DELITO\s*[:\-]?\s*(.+)', re.I),
+    ],
+    'carpeta_fiscal': [
+        re.compile(r'CARPETA\s+FISCAL\s*[:\-]?\s*([A-Z0-9\-\./]+)', re.I),
+    ],
+    'placa': [
+        re.compile(r'Placa(?:\s*Nro\.)?\s*[:\-]?\s*([A-Z0-9\-]+)', re.I),
+        re.compile(r'PLACA\s+NRO\.\s*[:\-]?\s*([A-Z0-9\-]+)', re.I),
+    ],
+    'marca': [
+        re.compile(r'Marca\s*[:\-]?\s*([A-Z0-9\-\s]+)', re.I),
+    ],
+    'color': [
+        re.compile(r'Color\s*[:\-]?\s*([A-ZÁÉÍÓÚÑ\s\-]+)', re.I),
+    ],
+    'anio': [
+        re.compile(r'Añ[oó]\s*[:\-]?\s*(\d{4})', re.I),
+        re.compile(r'Año\s*[:\-]?\s*(\d{4})', re.I),
+    ],
+}
+
+# Normalización de claves “clave → canonical”
+KEY_NORMALIZATION = {
+    'expediente': 'expediente',
+    'juzgado': 'juzgado',
+    'juez': 'juez',
+    'especialista': 'especialista',
+    'es. legal': 'especialista',
+    'imputado': 'imputado',
+    'agraviado': 'agraviado',
+    'delito': 'delito',
+    'carpeta fiscal': 'carpeta_fiscal',
+    'placa': 'placa',
+    'placa nro.': 'placa',
+    'marca': 'marca',
+    'color': 'color',
+    'año': 'anio', 'ano': 'anio',
+    'f.inicio': 'fecha_inicio',
+    'fecha': 'fecha',
+    'hora': 'hora',
+}
 
 # ----------------------------
 # Helpers básicos
@@ -266,6 +339,166 @@ def perform_advanced_ocr(image_path: str, language: str = 'spa') -> str:
     return best_text
 
 # ----------------------------
+# Estructurado (KV, campos, tablas, markdown)
+# ----------------------------
+def _normalize_key(k: str) -> str:
+    k0 = re.sub(r'[^A-Za-zÁÉÍÓÚÑáéíóú0-9\. ]+', '', k).strip().lower()
+    k0 = k0.replace('  ', ' ')
+    return KEY_NORMALIZATION.get(k0, k0)
+
+def extract_kv_pairs(text: str) -> Dict[str, str]:
+    """
+    Extrae pares clave:valor de líneas con ':' o '|' y normaliza claves.
+    """
+    kv: Dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if '|' in line:
+            parts = [p.strip(' :.-') for p in line.split('|') if p.strip()]
+            if len(parts) >= 2 and len(parts[0]) <= 40:
+                key = _normalize_key(parts[0])
+                val = ' | '.join(parts[1:]).strip()
+                if key and val and key not in kv:
+                    kv[key] = val
+                continue
+        if ':' in line:
+            left, right = line.split(':', 1)
+            key = _normalize_key(left)
+            val = right.strip(' .-')
+            if key and val and key not in kv and len(left) <= 40:
+                kv[key] = val
+    return kv
+
+def extract_field_patterns(text: str) -> Dict[str, str]:
+    """
+    Aplica regex de dominio para capturar campos importantes (expediente, juzgado, etc.).
+    """
+    found: Dict[str, str] = {}
+    # priorizar primeras páginas (menos ruido)
+    head = '\n'.join(text.splitlines()[:500])
+    for fname, patterns in FIELD_PATTERNS.items():
+        for pat in patterns:
+            m = pat.search(head)
+            if m:
+                val = m.group(1).strip().strip(' .-')
+                if val:
+                    found[fname] = val
+                    break
+    return found
+
+def extract_ascii_tables_from_text(text: str) -> List['pd.DataFrame']:
+    """
+    Detección simple de tablas 'ASCII' (líneas con pipes '|') en texto OCR.
+    """
+    dfs: List['pd.DataFrame'] = []
+    if pd is None:
+        return dfs
+    blocks = text.split('\n\n')
+    for blk in blocks:
+        lines = [l for l in blk.splitlines() if l.strip()]
+        if len(lines) < 2:
+            continue
+        if sum(1 for l in lines if '|' in l) >= 2:
+            rows = []
+            for l in lines:
+                if '|' in l:
+                    parts = [p.strip() for p in l.split('|')]
+                    # quitar separadores típicos
+                    parts = [re.sub(r'^-+$', '', p) for p in parts]
+                    rows.append(parts)
+            # Normalizar ancho
+            maxlen = max((len(r) for r in rows), default=0)
+            norm = [r + [''] * (maxlen - len(r)) for r in rows]
+            if norm:
+                df = pd.DataFrame(norm)
+                # usar primera fila como cabecera si es razonable
+                if df.shape[0] >= 2:
+                    df.columns = [c if c else f'col{i+1}' for i, c in enumerate(df.iloc[0].tolist())]
+                    df = df.iloc[1:].reset_index(drop=True)
+                dfs.append(df)
+    return dfs
+
+def extract_tables_pdf_native(pdf_path: str) -> List['pd.DataFrame']:
+    """
+    Usa pdfplumber para extraer tablas de PDFs con texto nativo.
+    """
+    dfs: List['pd.DataFrame'] = []
+    if pdfplumber is None or pd is None:
+        return dfs
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                try:
+                    tables = page.extract_tables()
+                    for t in tables or []:
+                        if not t or len(t) < 2:
+                            continue
+                        df = pd.DataFrame(t[1:], columns=[c or f'col{i+1}' for i, c in enumerate(t[0])])
+                        dfs.append(df)
+                except Exception:
+                    continue
+    except Exception as e:
+        logger.debug(f"pdfplumber failed: {e}")
+    return dfs
+
+def save_tables_to_csv(dfs: List['pd.DataFrame'], out_dir: str, prefix: str = 'table') -> List[str]:
+    paths: List[str] = []
+    if pd is None:
+        return paths
+    os.makedirs(out_dir, exist_ok=True)
+    for i, df in enumerate(dfs, 1):
+        fn = os.path.join(out_dir, f'{prefix}_{i:02d}.csv')
+        try:
+            df.to_csv(fn, index=False)
+            paths.append(fn)
+        except Exception:
+            # fallback simple
+            with open(fn, 'w', encoding='utf-8') as f:
+                for idx, row in df.iterrows():
+                    f.write(','.join(str(x) for x in row.tolist()) + '\n')
+            paths.append(fn)
+    return paths
+
+def build_markdown(meta: Dict[str, Any], fields: Dict[str, str], kv: Dict[str, str],
+                   tables_preview: List['pd.DataFrame'], plain_text: str) -> str:
+    """
+    Genera un Markdown con estilo 'index extract'.
+    """
+    lines = []
+    lines.append(f"# METADATOS")
+    for k, v in meta.items():
+        lines.append(f"- **{k}**: {v}")
+    lines.append("")
+    if fields:
+        lines.append("# CAMPOS")
+        for k, v in fields.items():
+            lines.append(f"- **{k}**: {v}")
+        lines.append("")
+    if kv:
+        lines.append("# KV DETECTADOS")
+        for k, v in kv.items():
+            if k in fields:
+                continue
+            lines.append(f"- **{k}**: {v}")
+        lines.append("")
+    if tables_preview and pd is not None:
+        lines.append("# TABLAS (vista previa)")
+        for i, df in enumerate(tables_preview[:5], 1):
+            lines.append(f"## Tabla {i}")
+            # to markdown
+            try:
+                md = df.head(10).to_markdown(index=False)
+            except Exception:
+                md = '\n'.join([' | '.join(map(str, r)) for r in df.head(10).values.tolist()])
+            lines.append(md)
+            lines.append("")
+    lines.append("# TEXTO")
+    lines.append(plain_text.strip())
+    return '\n'.join(lines)
+
+# ----------------------------
 # Procesamiento de PDFs
 # ----------------------------
 def process_text_pdf(pdf_path: str, output_path: str) -> Tuple[bool, int, str]:
@@ -381,9 +614,11 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
-        'version': '2.1.0',
+        'version': '2.3.0',
         'dpi': OCR_DPI,
-        'lang_default': OCR_LANG_DEFAULT
+        'lang_default': OCR_LANG_DEFAULT,
+        'pdfplumber': bool(pdfplumber is not None),
+        'pandas': bool(pd is not None)
     })
 
 @app.route('/ocr/train', methods=['POST'])
@@ -422,6 +657,46 @@ def load_custom_corrections():
         except Exception as e:
             logger.warning(f"Error loading custom corrections: {e}")
 
+def _structured_outputs(pdf_path: str, text: str, out_base: str, need_tables: bool) -> Dict[str, Any]:
+    """
+    Genera campos clave, kv y tablas (si se puede) + Markdown.
+    """
+    kv = extract_kv_pairs(text)
+    fields = extract_field_patterns(text)
+
+    table_dfs: List['pd.DataFrame'] = []
+    table_csvs: List[str] = []
+
+    if need_tables:
+        # Si el PDF es nativo, usa pdfplumber; de lo contrario, intenta tablas ASCII del OCR.
+        if pdfplumber is not None:
+            try:
+                # Heurística: si el PDF NO es bitmap, pdfplumber tendrá mejores resultados
+                if not contains_bitmap(pdf_path):
+                    table_dfs = extract_tables_pdf_native(pdf_path)
+            except Exception:
+                pass
+        if not table_dfs:
+            table_dfs = extract_ascii_tables_from_text(text)
+
+        if table_dfs and pd is not None:
+            tables_dir = os.path.join(app.config['OUTPUT_FOLDER'], f'{out_base}_tables')
+            table_csvs = save_tables_to_csv(table_dfs, tables_dir, prefix='table')
+
+    # Markdown
+    meta = {
+        'archivo': out_base,
+        'generado': datetime.now().isoformat(),
+    }
+    md = build_markdown(meta, fields, kv, table_dfs, text)
+
+    return {
+        'fields': fields,
+        'kv_pairs': kv,
+        'tables_csv': [os.path.basename(p) for p in table_csvs],
+        'markdown': md
+    }
+
 @app.route('/ocr/process', methods=['POST'])
 def process_pdf():
     try:
@@ -437,7 +712,8 @@ def process_pdf():
 
         # Parámetros
         language = request.form.get('language', OCR_LANG_DEFAULT)
-        output_format = request.form.get('format', 'txt')  # txt | json
+        output_format = request.form.get('format', 'txt')  # txt | json | md | zip
+        want_structured = request.form.get('structured', '0') == '1'
 
         # Guardar archivo
         filename = secure_filename(file.filename)
@@ -447,8 +723,9 @@ def process_pdf():
         file.save(file_path)
 
         # Salida
-        output_filename = f"{timestamp}_{os.path.splitext(filename)[0]}.txt"
-        output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
+        base_name = f"{timestamp}_{os.path.splitext(filename)[0]}"
+        txt_filename = f"{base_name}.txt"
+        txt_path = os.path.join(app.config['OUTPUT_FOLDER'], txt_filename)
 
         logger.info(f"Processing file: {temp_filename} | lang={language} | dpi={OCR_DPI}")
 
@@ -458,37 +735,90 @@ def process_pdf():
         # Elección de estrategia
         if contains_bitmap(file_path):
             logger.info("Mode: enhanced OCR (bitmap/scan)")
-            success, pages_processed, text = process_bitmap_pdf(file_path, output_path, language)
+            success, pages_processed, text = process_bitmap_pdf(file_path, txt_path, language)
             method = 'enhanced_ocr'
         else:
             logger.info("Mode: text extraction with corrections")
-            success, pages_processed, text = process_text_pdf(file_path, output_path)
+            success, pages_processed, text = process_text_pdf(file_path, txt_path)
             method = 'text_extraction_corrected'
 
         processing_time = (datetime.now() - start_time).total_seconds()
 
-        if success:
-            if output_format == 'json':
-                return jsonify({
-                    'success': True,
-                    'filename': filename,
-                    'pages_processed': pages_processed,
-                    'processing_time': round(processing_time, 2),
-                    'method': method,
-                    'language': language,
-                    'corrections_applied': len(CHAR_CORRECTIONS),
-                    'text': text,
-                    'timestamp': datetime.now().isoformat()
-                })
-            else:
-                return send_file(output_path, as_attachment=True,
-                                 download_name=f"{os.path.splitext(filename)[0]}.txt")
-        else:
+        if not success:
             return jsonify({
                 'success': False,
                 'error': text,
                 'processing_time': round(processing_time, 2)
             }), 500
+
+        # Si el cliente quiere estructurado o formatos ricos, generarlo
+        extra: Dict[str, Any] = {}
+        md_path = None
+        json_doc = None
+
+        if want_structured or output_format in ('json', 'md', 'zip'):
+            extra = _structured_outputs(file_path, text, base_name, need_tables=True)
+
+            # Guardar markdown si se va a devolver/zip
+            md_path = os.path.join(app.config['OUTPUT_FOLDER'], f"{base_name}.md")
+            with open(md_path, 'w', encoding='utf-8') as fmd:
+                fmd.write(extra['markdown'])
+
+            # JSON estructurado
+            json_doc = {
+                'success': True,
+                'filename': filename,
+                'pages_processed': pages_processed,
+                'processing_time': round(processing_time, 2),
+                'method': method,
+                'language': language,
+                'corrections_applied': len(CHAR_CORRECTIONS),
+                'timestamp': datetime.now().isoformat(),
+                'text': text,
+                'fields': extra.get('fields', {}),
+                'kv_pairs': extra.get('kv_pairs', {}),
+                'tables_csv': extra.get('tables_csv', []),
+            }
+
+        # Responder según formato
+        if output_format == 'json':
+            return jsonify(json_doc if json_doc else {
+                'success': True,
+                'filename': filename,
+                'pages_processed': pages_processed,
+                'processing_time': round(processing_time, 2),
+                'method': method,
+                'language': language,
+                'corrections_applied': len(CHAR_CORRECTIONS),
+                'text': text,
+                'timestamp': datetime.now().isoformat()
+            })
+
+        if output_format == 'md' and md_path:
+            return send_file(md_path, as_attachment=True, download_name=f"{os.path.splitext(filename)[0]}.md")
+
+        if output_format == 'zip':
+            # Empaquetar: txt + (md) + (json) + tablas
+            zip_name = f"{base_name}.zip"
+            zip_path = os.path.join(app.config['OUTPUT_FOLDER'], zip_name)
+            import json as _json
+            with zipfile.ZipFile(zip_path, 'w') as z:
+                z.write(txt_path, arcname=os.path.basename(txt_path))
+                if md_path and os.path.exists(md_path):
+                    z.write(md_path, arcname=os.path.basename(md_path))
+                # JSON
+                if json_doc:
+                    z.writestr(f"{base_name}.json", _json.dumps(json_doc, ensure_ascii=False, indent=2))
+                # tablas
+                tables_dir = os.path.join(app.config['OUTPUT_FOLDER'], f'{base_name}_tables')
+                if os.path.isdir(tables_dir):
+                    for root, _, files in os.walk(tables_dir):
+                        for f in files:
+                            z.write(os.path.join(root, f), arcname=f)
+            return send_file(zip_path, as_attachment=True, download_name=os.path.basename(zip_path))
+
+        # Por defecto: txt
+        return send_file(txt_path, as_attachment=True, download_name=f"{os.path.splitext(filename)[0]}.txt")
 
     except Exception as e:
         logger.error(f"Error processing PDF: {str(e)}")
@@ -508,6 +838,7 @@ def process_batch():
             return jsonify({'error': 'No files provided'}), 400
 
         language = request.form.get('language', OCR_LANG_DEFAULT)
+        structured = request.form.get('structured', '0') == '1'
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         batch_folder = os.path.join(app.config['OUTPUT_FOLDER'], f'batch_{timestamp}')
         os.makedirs(batch_folder, exist_ok=True)
@@ -523,24 +854,37 @@ def process_batch():
                     file.save(file_path)
                     temp_files.append(file_path)
 
-                    output_filename = f"{os.path.splitext(filename)[0]}.txt"
-                    output_path = os.path.join(batch_folder, output_filename)
+                    base_name = os.path.splitext(filename)[0]
+                    out_txt = os.path.join(batch_folder, f"{base_name}.txt")
 
                     if contains_bitmap(file_path):
-                        success, pages, text = process_bitmap_pdf(file_path, output_path, language)
+                        success, pages, text = process_bitmap_pdf(file_path, out_txt, language)
                         method = 'enhanced_ocr'
                     else:
-                        success, pages, text = process_text_pdf(file_path, output_path)
+                        success, pages, text = process_text_pdf(file_path, out_txt)
                         method = 'text_extraction_corrected'
 
-                    results.append({
+                    item = {
                         'filename': filename,
                         'success': success,
                         'pages': pages,
                         'method': method,
                         'corrections_applied': len(CHAR_CORRECTIONS),
                         'error': None if success else text
-                    })
+                    }
+
+                    if success and structured:
+                        extra = _structured_outputs(file_path, text, base_name, need_tables=True)
+                        # Guardar MD
+                        md_path = os.path.join(batch_folder, f"{base_name}.md")
+                        with open(md_path, 'w', encoding='utf-8') as fmd:
+                            fmd.write(extra['markdown'])
+                        item['fields'] = extra.get('fields', {})
+                        item['kv_pairs'] = extra.get('kv_pairs', {})
+                        item['tables_csv'] = extra.get('tables_csv', [])
+
+                    results.append(item)
+
                 except Exception as e:
                     results.append({
                         'filename': file.filename,
@@ -556,10 +900,11 @@ def process_batch():
                 pass
 
         # Crear ZIP con resultados + resumen
-        zip_filename = f'ocr_batch_enhanced_{timestamp}.zip'
+        zip_filename = f'ocr_batch_{timestamp}.zip'
         zip_path = os.path.join(app.config['OUTPUT_FOLDER'], zip_filename)
 
         with zipfile.ZipFile(zip_path, 'w') as zipf:
+            # Agregar archivos
             for root, _, fs in os.walk(batch_folder):
                 for f in fs:
                     zipf.write(os.path.join(root, f), f)
@@ -599,6 +944,6 @@ def _bootstrap():
 _bootstrap()
 
 if __name__ == '__main__':
-    # En producción usa Gunicorn:
-    # gunicorn --bind 0.0.0.0:5000 --workers 2 --timeout 600 app:app
+    # En producción usa Gunicorn (y sube el timeout si hay PDFs grandes):
+    # gunicorn --bind 0.0.0.0:5000 --workers 2 --timeout 900 app:app
     app.run(host='0.0.0.0', port=5000, debug=False)

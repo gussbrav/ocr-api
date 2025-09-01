@@ -62,14 +62,24 @@ def contains_bitmap(pdf_path):
         logger.warning(f"Error checking PDF content: {e}")
         return True  # Si no podemos determinar, asumimos que contiene bitmaps
 
+def get_page_separator(page_num, total_pages):
+    """Generar separador de página con formato consistente"""
+    return f"\n\n--- PÁGINA {page_num} DE {total_pages}\n\n"
+
 def process_text_pdf(pdf_path, output_path):
     """Procesar PDFs que son principalmente texto (basado en tu código)"""
     try:
         text = ""
         with open(pdf_path, 'rb') as f:
             pdf = PdfReader(f)
-            for page in pdf.pages:
-                text += page.extract_text() + "\n\n"
+            total_pages = len(pdf.pages)
+            
+            for i, page in enumerate(pdf.pages, 1):
+                page_text = page.extract_text()
+                if page_text:
+                    # Agregar separador de página
+                    text += get_page_separator(i, total_pages)
+                    text += page_text
         
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(text)
@@ -85,9 +95,14 @@ def process_bitmap_pdf(pdf_path, output_path, language='spa'):
             # Convertir PDF a imágenes
             images = convert_from_path(pdf_path, dpi=300)
             all_text = ""
+            total_pages = len(images)
             
             for i, image in enumerate(images):
                 try:
+                    # Agregar separador de página
+                    page_separator = get_page_separator(i + 1, total_pages)
+                    all_text += page_separator
+                    
                     # Guardar imagen como PPM
                     ppm_file = f"{temp_dir}/page_{i}.ppm"
                     image.save(ppm_file, "PPM")
@@ -140,11 +155,12 @@ def process_bitmap_pdf(pdf_path, output_path, language='spa'):
                     
                     # OCR con Tesseract usando el idioma especificado
                     text = pytesseract.image_to_string(tiff_file, lang=language)
-                    all_text += f"\n--- Página {i + 1} ---\n{text}\n\n"
+                    all_text += text
                     
                 except Exception as e:
                     logger.error(f"Error processing page {i + 1}: {e}")
-                    all_text += f"\n--- Página {i + 1} ---\nError procesando página: {str(e)}\n\n"
+                    error_separator = get_page_separator(i + 1, total_pages)
+                    all_text += f"{error_separator}Error procesando página: {str(e)}"
             
             # Escribir texto final al archivo de salida
             with open(output_path, 'w', encoding='utf-8') as f:

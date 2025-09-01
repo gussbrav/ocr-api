@@ -68,7 +68,6 @@ OSD_ENABLED = os.getenv('OSD_ENABLED', '1') == '1'          # Corrección de ori
 # Correcciones y patrones
 # ----------------------------
 CHAR_CORRECTIONS = {
-    'N0': 'N°', 'NO': 'N°', 'Np': 'N°', 'N8': 'N°', 'N6': 'N°',
     'Nro': 'Nro', 'NRO': 'Nro', 'nro': 'Nro', 'Nr0': 'Nro', 'Nrp': 'Nro',
     'Num': 'Núm', 'NUM': 'Núm', 'núm': 'Núm', 'numero': 'número',
     'NUMERO': 'NÚMERO', 'JUZGADO': 'JUZGADO', 'CIVIL': 'CIVIL', 'PENAL': 'PENAL',

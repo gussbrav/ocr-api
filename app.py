@@ -537,7 +537,7 @@ def extract_peruvian_legal_fields(text: str) -> Dict[str, Any]:
 # ----------------------------
 def get_page_separator(page_num: int, total_pages: int) -> str:
     """Generate page separator for multi-page documents."""
-    return f"\n{'='*50}\nPÁGINA {page_num} DE {total_pages}\n{'='*50}\n\n"
+    return f"\n\n--- Página {page_num} de {total_pages} ---\n\n"
 
 @dataclass
 class PageProcessingResult:
